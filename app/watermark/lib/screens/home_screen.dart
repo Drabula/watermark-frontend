@@ -6,6 +6,8 @@ import 'dart:io';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:watermark/screens/watermarkUI.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -20,15 +22,18 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _isProcessing = false;
   String? _resultFilePath;
 
-  Future<void> _extractInvisibleWatermark() async {
+  final double _alpha = 0.1;
+  final double _scale = 0.25;
+  int? _wmH;
+  int? _wmW;
+
+  Future<void> _extractDWTWatermark() async {
     if (_mediaFile == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('❗ Vui lòng chọn ảnh hoặc video trước')),
+        const SnackBar(content: Text('❗ Chưa chọn file để trích watermark')),
       );
       return;
     }
-
-    bool isVideo = _mediaFile!.path.toLowerCase().endsWith('.mp4');
 
     setState(() {
       _isProcessing = true;
@@ -36,51 +41,57 @@ class _HomeScreenState extends State<HomeScreen> {
     });
 
     try {
-      var dio = Dio();
-      var formData = FormData.fromMap({
+      final isVideo = _mediaFile!.path.toLowerCase().endsWith('.mp4');
+
+      if (!isVideo) {
+        final imageBytes = await _watermark!.readAsBytes();
+        final decodedImage = await decodeImageFromList(imageBytes);
+        _wmH = decodedImage.height;
+        _wmW = decodedImage.width;
+      } else {
+        _wmH = 150;
+        _wmW = 150;
+      }
+
+      final dio = Dio();
+      final formData = FormData.fromMap({
         'file': await MultipartFile.fromFile(_mediaFile!.path),
-        'type': isVideo ? 'video' : 'image',
+        'wm_h': _wmH.toString(),
+        'wm_w': _wmW.toString(),
+        'alpha': _alpha.toString(),
       });
 
-      Response response = await dio.post(
-        'http://192.168.1.249:5000/extract_invisible_watermark',
+      final response = await dio.post(
+        isVideo
+            ? 'http://192.168.51.249:5000/extract_dwt_video'
+            : 'http://192.168.51.249:5000/extract_dwt',
         data: formData,
         options: Options(responseType: ResponseType.bytes),
       );
 
-      if (response.statusCode == 200 && response.data.isNotEmpty) {
-        var permission = await Permission.storage.request();
-        if (!permission.isGranted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('⚠ Không có quyền lưu trữ')),
-          );
-          return;
-        }
+      final downloadsDir = Platform.isAndroid
+          ? Directory('/storage/emulated/0/Download')
+          : await getDownloadsDirectory() ??
+          await getApplicationDocumentsDirectory();
 
-        final downloadsDir = Platform.isAndroid
-            ? Directory('/storage/emulated/0/Download')
-            : await getDownloadsDirectory() ?? await getApplicationDocumentsDirectory();
+      final filePath =
+          '${downloadsDir.path}/extracted_dwt_${DateTime
+          .now()
+          .millisecondsSinceEpoch}.png';
 
-        String filePath = '${downloadsDir.path}/extracted_watermark_${DateTime.now().millisecondsSinceEpoch}.png';
-        File resultFile = File(filePath);
-        await resultFile.writeAsBytes(response.data);
+      final resultFile = File(filePath);
+      await resultFile.writeAsBytes(response.data);
 
-        if (await resultFile.exists()) {
-          setState(() {
-            _resultFilePath = filePath;
-          });
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('✅ Đã trích xuất watermark ẩn thành công!')),
-          );
-        } else {
-          throw Exception('Không ghi được file!');
-        }
-      } else {
-        throw Exception('Lỗi xử lý từ server hoặc không có dữ liệu!');
-      }
+      setState(() {
+        _resultFilePath = filePath;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('✅ Trích watermark ẩn thành công!')),
+      );
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Lỗi: $e')),
+        SnackBar(content: Text('❌ Lỗi: $e')),
       );
     } finally {
       setState(() {
@@ -95,12 +106,14 @@ class _HomeScreenState extends State<HomeScreen> {
     if (pickedFile != null) {
       setState(() {
         _mediaFile = File(pickedFile.path);
+        _resultFilePath = null;
       });
     }
   }
 
   Future<void> _pickWatermark() async {
-    final pickedFile = await ImagePicker().pickImage(source: ImageSource.gallery);
+    final pickedFile = await ImagePicker().pickImage(
+        source: ImageSource.gallery);
     if (pickedFile != null) {
       setState(() {
         _watermark = File(pickedFile.path);
@@ -124,58 +137,52 @@ class _HomeScreenState extends State<HomeScreen> {
 
     try {
       var dio = Dio();
+
+      String endpoint;
+      if (isVisibleWatermark) {
+        endpoint = 'embed_visible_watermark';
+      } else {
+        endpoint = isVideo ? 'embed_dwt_video' : 'embed_dwt';
+      }
+
       var formData = FormData.fromMap({
-        'file': await MultipartFile.fromFile(_mediaFile!.path, filename: 'input.${isVideo ? 'mp4' : 'png'}'),
-        'watermark': await MultipartFile.fromFile(_watermark!.path, filename: 'watermark.png'),
+        'file': await MultipartFile.fromFile(
+            _mediaFile!.path, filename: 'input.${isVideo ? 'mp4' : 'png'}'),
+        'watermark': await MultipartFile.fromFile(
+            _watermark!.path, filename: 'watermark.png'),
         'type': isVideo ? 'video' : 'image',
+        if (!isVisibleWatermark) 'alpha': _alpha.toString(),
+        if (!isVisibleWatermark && !isVideo) 'scale': _scale.toString(),
+        // chỉ ảnh mới cần scale
       });
 
       Response response = await dio.post(
-        'http://192.168.1.249:5000/embed_${isVisibleWatermark ? 'visible' : 'invisible'}_watermark',
+        'http://192.168.51.249:5000/$endpoint',
         data: formData,
         options: Options(responseType: ResponseType.bytes),
       );
 
-      if (response.statusCode == 200 && response.data.isNotEmpty) {
-        // Yêu cầu quyền lưu trữ
-        var status = await Permission.storage.request();
-        if (!status.isGranted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Ứng dụng cần quyền truy cập bộ nhớ để lưu file.')),
-          );
-          return;
-        }
+      final downloadsDir = Platform.isAndroid
+          ? Directory('/storage/emulated/0/Download')
+          : await getDownloadsDirectory() ??
+          await getApplicationDocumentsDirectory();
 
-        // Lấy thư mục Downloads (Android/iOS)
-        Directory downloadsDir;
-        if (Platform.isAndroid) {
-          downloadsDir = Directory('/storage/emulated/0/Download');
-        } else {
-          downloadsDir = await getDownloadsDirectory() ?? await getApplicationDocumentsDirectory();
-        }
+      String fileExtension = isVideo ? 'mp4' : 'png';
+      String fileName = 'watermarked_${DateTime
+          .now()
+          .millisecondsSinceEpoch}.$fileExtension';
+      String filePath = '${downloadsDir.path}/$fileName';
 
-        String fileExtension = isVideo ? 'mp4' : 'png';
-        String fileName = 'watermarked_${DateTime.now().millisecondsSinceEpoch}.$fileExtension';
-        String filePath = '${downloadsDir.path}/$fileName';
+      File resultFile = File(filePath);
+      await resultFile.writeAsBytes(response.data);
 
-        File resultFile = File(filePath);
-        await resultFile.writeAsBytes(response.data);
+      setState(() {
+        _resultFilePath = filePath;
+      });
 
-        if (await resultFile.exists()) {
-          setState(() {
-            _resultFilePath = filePath;
-          });
-
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('✅ Đã lưu kết quả tại: ${downloadsDir.path}')),
-          );
-        } else {
-          throw Exception("Lỗi ghi file kết quả!");
-        }
-      }
-      else {
-        throw Exception("Lỗi xử lý ảnh/video: ${response.statusCode}");
-      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('✅ Đã lưu kết quả tại: ${downloadsDir.path}')),
+      );
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Lỗi: $e')),
@@ -187,16 +194,21 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Widget _buildPreview(File? file) {
-    if (file == null) return Text('Chưa chọn ảnh hoặc video');
 
+  Widget _buildPreview(File? file) {
+    if (file == null) return const Text('Chưa chọn ảnh hoặc video');
+
+    bool isVideo = file.path.toLowerCase().endsWith('.mp4');
     return Container(
       height: 200,
-      decoration: BoxDecoration(border: Border.all(color: Colors.grey), borderRadius: BorderRadius.circular(8)),
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.grey),
+        borderRadius: BorderRadius.circular(8),
+      ),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(8),
-        child: file.path.toLowerCase().endsWith('.mp4')
-            ? VideoWidget(videoFile: file)
+        child: isVideo
+            ? VideoWidget(key: ValueKey(file.path), videoFile: file)
             : Image.file(file, fit: BoxFit.cover, width: double.infinity),
       ),
     );
@@ -221,136 +233,17 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Ứng dụng Nhúng Watermark')),
-      body: SingleChildScrollView(
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Card(
-                elevation: 4,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Column(
-                    children: [
-                      Text("Xem trước ảnh/video", style: Theme.of(context).textTheme.titleMedium),
-                      SizedBox(height: 10),
-                      _buildPreview(_mediaFile),
-                      if (_mediaFile != null) Text("Đã chọn: ${_mediaFile!.path.split('/').last}"),
-                    ],
-                  ),
-                ),
-              ),
-              SizedBox(height: 20),
-              Card(
-                elevation: 4,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Column(
-                    children: [
-                      Text("Watermark", style: Theme.of(context).textTheme.titleMedium),
-                      SizedBox(height: 10),
-                      _watermark != null
-                          ? Image.file(_watermark!, height: 50)
-                          : Text('Chưa chọn watermark'),
-                      if (_watermark != null) Text("Đã chọn: ${_watermark!.path.split('/').last}"),
-                    ],
-                  ),
-                ),
-              ),
-              SizedBox(height: 20),
-              Wrap(
-                spacing: 10,
-                runSpacing: 10,
-                children: [
-                  ElevatedButton.icon(
-                    icon: Icon(Icons.photo_library),
-                    onPressed: _pickMedia,
-                    label: Text('Chọn ảnh/video'),
-                  ),
-                  ElevatedButton.icon(
-                    icon: Icon(Icons.image),
-                    onPressed: _pickWatermark,
-                    label: Text('Chọn watermark'),
-                  ),
-                  ElevatedButton.icon(
-                    icon: Icon(Icons.visibility),
-                    onPressed: () => _uploadMedia(true),
-                    label: Text('Thủy vân hiển thị'),
-                  ),
-                  ElevatedButton.icon(
-                    icon: Icon(Icons.visibility_off),
-                    onPressed: () => _uploadMedia(false),
-                    label: Text('Thủy vân ẩn'),
-                  ),
-                  ElevatedButton.icon(
-                    icon: Icon(Icons.water_damage),
-                    onPressed: _extractInvisibleWatermark,
-                    label: Text('Trích xuất thủy vân ẩn'),
-                  ),
-                ],
-              ),
-              SizedBox(height: 20),
-              if (_isProcessing) Center(child: CircularProgressIndicator()),
-              if (!_isProcessing && _resultFilePath != null) ...[
-                Divider(height: 40),
-                Text("Kết quả", style: Theme.of(context).textTheme.titleLarge),
-                SizedBox(height: 10),
-                _buildPreview(File(_resultFilePath!)),
-                SizedBox(height: 10),
-                ElevatedButton.icon(
-                  icon: Icon(Icons.download),
-                  onPressed: _downloadResult,
-                  label: Text('Tải xuống'),
-                ),
-              ],
-            ],
-          ),
-        ),
-      ),
+    return WatermarkMinimalUI(
+      mediaFile: _mediaFile,
+      watermarkFile: _watermark,
+      resultFilePath: _resultFilePath,
+      isProcessing: _isProcessing,
+      onPickMedia: _pickMedia,
+      onPickWatermark: _pickWatermark,
+      onEmbedVisible: () => _uploadMedia(true),
+      onEmbedInvisible: () => _uploadMedia(false),
+      onExtract: _extractDWTWatermark,
+      onDownload: _downloadResult,
     );
-  }
-}
-
-class VideoWidget extends StatefulWidget {
-  final File videoFile;
-  const VideoWidget({required this.videoFile});
-
-  @override
-  _VideoWidgetState createState() => _VideoWidgetState();
-}
-
-class _VideoWidgetState extends State<VideoWidget> {
-  late VideoPlayerController _controller;
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = VideoPlayerController.file(widget.videoFile)
-      ..initialize().then((_) {
-        setState(() {});
-        _controller.setLooping(true);
-        _controller.play();
-      });
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return _controller.value.isInitialized
-        ? AspectRatio(
-      aspectRatio: _controller.value.aspectRatio,
-      child: VideoPlayer(_controller),
-    )
-        : Center(child: CircularProgressIndicator());
   }
 }
